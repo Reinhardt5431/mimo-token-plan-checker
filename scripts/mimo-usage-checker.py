@@ -479,6 +479,22 @@ def analyze_xlsx(filepath, plan_override=None, quota_override=None,
                 print(f"  ✅ 按当前速率，月底前够用")
     print()
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 引导用户继续提问
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    print("━" * 90)
+    print("  💬 还需要分析什么数据？可以直接问我，例如：")
+    print("━" * 90)
+    print()
+    print("  • 「对比上个周期的消耗变化」")
+    print("  • 「哪天消耗最高？分析原因」")
+    print("  • 「缓存命中率对 Credits 的影响有多大？」")
+    print("  • 「按小时分析消耗分布」")
+    print("  • 「如果换成 Pro 套餐要花多少钱？」")
+    print("  • 「帮我写一个消耗预警规则」")
+    print("  • 「导出一份 Markdown 报告」")
+    print()
+
 
 def plan_type_yearly(plan_name, official_data):
     """从 official_data 判断是否年度套餐"""
