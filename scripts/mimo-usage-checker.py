@@ -331,6 +331,15 @@ async def login():
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
         ctx = await browser.new_context(accept_downloads=True)
+
+        # 加载已保存的 Cookie
+        cookie_file = os.path.join(CONFIG_DIR, "cookies.json")
+        if os.path.exists(cookie_file):
+            with open(cookie_file, "r", encoding="utf-8") as f:
+                cookies = json.load(f)
+            await ctx.add_cookies(cookies)
+            print("  🍪 已加载保存的 Cookie\n")
+
         page = await ctx.new_page()
         await page.goto('https://platform.xiaomimimo.com/console/plan-manage')
 
