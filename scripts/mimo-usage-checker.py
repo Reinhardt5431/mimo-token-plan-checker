@@ -6,6 +6,7 @@ MiMo Token Plan 用量分析工具
   python mimo-usage-checker.py                      # 分析最近的导出文件
   python mimo-usage-checker.py --xlsx <file.xlsx>   # 分析指定文件
   python mimo-usage-checker.py --plan standard      # 手动指定套餐
+  python mimo-usage-checker.py --official-credits 3305500000  # 指定官网显示的 Credits 数值
 """
 import asyncio
 import json
@@ -45,9 +46,11 @@ def load_plan_info():
     return None
 
 
-def save_plan_info(plan_name, quota, plan_type="monthly"):
+def save_plan_info(plan_name, quota, plan_type="monthly", official_credits=None):
     os.makedirs(CONFIG_DIR, exist_ok=True)
     info = {"plan_name": plan_name, "quota": quota, "plan_type": plan_type}
+    if official_credits is not None:
+        info["official_credits"] = official_credits
     with open(PLAN_INFO_FILE, "w", encoding="utf-8") as f:
         json.dump(info, f, ensure_ascii=False, indent=2)
 
@@ -81,7 +84,7 @@ def fmt(n):
     return f"{n:.0f}"
 
 
-def analyze_xlsx(filepath, plan_override=None, quota_override=None):
+def analyze_xlsx(filepath, plan_override=None, quota_override=None, official_credits=None):
     try:
         import openpyxl
     except ImportError:
@@ -170,31 +173,68 @@ def analyze_xlsx(filepath, plan_override=None, quota_override=None):
     print("=" * 90)
     print()
 
-    # --- 1. 总览 ---
-    print("━━━ 1. 总览 ━━━")
-    print()
-    print(f"  套餐: {plan_name.upper()} | 额度: {fmt(quota)} Credits")
-    print()
-    print(f"  Token 总消耗:  {total_tk:>15,}")
-    print(f"  缓存命中:      {total_ih:>15,}  ({total_ih/total_input*100:.1f}%)" if total_input else "")
-    print(f"  缓存未命中:    {total_im:>15,}  ({total_im/total_input*100:.1f}%)" if total_input else "")
-    print(f"  输出 token:    {total_ot:>15,}")
-    print(f"  总请求数:      {total_rc:>15,}")
-    print(f"  Credits 消耗:  {total_cr:>15,.0f}  (xlsx 计算)")
-    print(f"  套餐额度:      {quota:>15,}")
-    print(f"  使用率:        {total_cr/quota*100:>14.1f}%")
-    print(f"  剩余额度:      {quota - total_cr:>15,.0f}")
-    print()
-    print("  ⚠️  注意: xlsx 导出包含全部历史数据，管理台只统计当前订阅周期内的 Credits。")
-    print("     两者 Token 总数一致说明换算公式正确，Credits 差异纯粹是时间范围不同。")
-    print("     以管理台显示的 Credits 为准。")
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 核心分析一：换算一致性验证
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    print("━" * 90)
+    print("  ① 换算一致性验证：xlsx 计算值 vs 官网显示值")
+    print("━" * 90)
     print()
 
-    # --- 2. 每日明细 ---
-    print("━━━ 2. 每日明细 ━━━")
+    # 从 plan_info 读取官网 Credits
+    if official_credits is None:
+        info = load_plan_info()
+        if info and "official_credits" in info:
+            official_credits = info["official_credits"]
+
+    print(f"  xlsx 换算 Credits（按官方公式计算）:  {total_cr:>15,.0f}")
+    print(f"  Token 总量（xlsx 导出）:              {total_tk:>15,}")
     print()
+
+    if official_credits is not None and official_credits > 0:
+        diff = total_cr - official_credits
+        diff_pct = abs(diff) / official_credits * 100 if official_credits else 0
+        print(f"  官网显示 Credits:                     {official_credits:>15,.0f}")
+        print(f"  差异（xlsx - 官网）:                  {diff:>+15,.0f}  ({diff_pct:+.2f}%)")
+        print()
+
+        if abs(diff) < official_credits * 0.01:
+            print("  ✅ 一致：xlsx 换算结果与官网显示基本一致（差异 < 1%）")
+            print("     说明：换算公式正确，数据无异常。")
+        elif diff > 0:
+            print("  ⚠️  xlsx 计算值 > 官网显示值")
+            print("     可能原因：")
+            print("     1. xlsx 包含历史数据，官网只统计当前订阅周期")
+            print("     2. 非高峰时段（00:00-08:00）0.8x 系数未在 xlsx 中体现")
+            print("     3. 官网可能排除了某些调试/测试请求")
+        else:
+            print("  ⚠️  xlsx 计算值 < 官网显示值")
+            print("     可能原因：")
+            print("     1. xlsx 未包含最近的消耗数据（导出延迟）")
+            print("     2. 官网可能包含了 xlsx 未记录的其他消耗来源")
+            print("     3. 换算规则可能有更新，xlsx 数据对应旧规则")
+    else:
+        print("  ⚠️  未提供官网 Credits 数值")
+        print("     对比方式：")
+        print("     1. 登录官网查看当前 Credits，然后重新运行：")
+        print("        python mimo-usage-checker.py --official-credits <数值>")
+        print("     2. 或在 --login 时从页面自动抓取（需更新控制台页面结构）")
+    print()
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 核心分析二：每日消耗分析
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    print("━" * 90)
+    print("  ② 每日消耗分析")
+    print("━" * 90)
+    print()
+
     print(f"  {'日期':<12} {'周':>2} {'Tokens':>12} {'缓存命中':>8} {'未命中':>10} {'输出':>8} {'Credits':>14} {'请求':>6}")
     print(f"  {'─'*12} {'─'*2} {'─'*12} {'─'*8} {'─'*10} {'─'*8} {'─'*14} {'─'*6}")
+
+    # 找出高峰/非高峰日
+    peak_days = []
+    off_peak_days = []
 
     for d in sorted(daily.keys()):
         v = daily[d]
@@ -211,8 +251,27 @@ def analyze_xlsx(filepath, plan_override=None, quota_override=None):
     print(f"  {'日均':<12} {'':>2} {total_tk//days:>12,} {'':>8} {'':>10} {'':>8} {total_cr/days:>14,.0f} {total_rc//days:>6}")
     print()
 
-    # --- 3. 按模型汇总 ---
-    print("━━━ 3. 按模型汇总 ━━━")
+    # 每日趋势分析
+    daily_list = sorted(daily.items())
+    if len(daily_list) >= 2:
+        credits_values = [v["credits"] for _, v in daily_list]
+        avg_cr = sum(credits_values) / len(credits_values)
+        max_day = max(daily_list, key=lambda x: x[1]["credits"])
+        min_day = min(daily_list, key=lambda x: x[1]["credits"])
+
+        print("  📈 趋势分析:")
+        print(f"     日均 Credits: {avg_cr:,.0f}")
+        print(f"     最高日: {max_day[0]} ({max_day[1]['credits']:,.0f} Credits, {max_day[1]['requests']:,} 请求)")
+        print(f"     最低日: {min_day[0]} ({min_day[1]['credits']:,.0f} Credits, {min_day[1]['requests']:,} 请求)")
+        print(f"     波动范围: {max_day[1]['credits']/min_day[1]['credits']:.1f}x" if min_day[1]["credits"] > 0 else "")
+    print()
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 补充：按模型汇总
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    print("━" * 90)
+    print("  ③ 按模型汇总")
+    print("━" * 90)
     print()
     print(f"  {'模型':<18} {'Tokens':>14} {'命中':>12} {'未命中':>10} {'输出':>10} {'Credits':>14} {'占比':>6} {'请求':>6}")
     print(f"  {'─'*18} {'─'*14} {'─'*12} {'─'*10} {'─'*10} {'─'*14} {'─'*6} {'─'*6}")
@@ -228,6 +287,33 @@ def analyze_xlsx(filepath, plan_override=None, quota_override=None):
     print("    非高峰(00:00-08:00 北京) 0.8x 系数")
     print("=" * 90)
     print()
+
+    # 套餐用量预估
+    if days > 0:
+        print("━" * 90)
+        print("  ④ 套餐用量预估")
+        print("━" * 90)
+        print()
+        today = datetime.date.today()
+        days_in_month = (today.replace(month=today.month % 12 + 1, day=1) - datetime.timedelta(days=1)).day if today.month < 12 else 31
+        days_passed = today.day
+        days_remaining = days_in_month - days_passed
+
+        projected = total_cr / days_passed * days_in_month if days_passed > 0 else 0
+        remaining = quota - total_cr
+        daily_burn = total_cr / days_passed if days_passed > 0 else 0
+        days_left = remaining / daily_burn if daily_burn > 0 else float('inf')
+
+        print(f"  当前天数:  月度第 {days_passed}/{days_in_month} 天")
+        print(f"  已用:      {fmt(total_cr)} Credits ({total_cr/quota*100:.1f}%)")
+        print(f"  剩余:      {fmt(remaining)} Credits")
+        print(f"  日均消耗:  {fmt(daily_burn)} Credits/天")
+        print(f"  预估月末:  {fmt(projected)} Credits ({projected/quota*100:.1f}%)")
+        if days_left < days_remaining:
+            print(f"  ⚠️  按当前速率，约 {days_left:.0f} 天后用完（本月还剩 {days_remaining} 天）")
+        else:
+            print(f"  ✅ 按当前速率，月底前够用（预计剩余 {days_left - days_remaining:.0f} 天的余量）")
+        print()
 
 
 async def login():
@@ -256,9 +342,10 @@ async def login():
             with open(os.path.join(CONFIG_DIR, "cookies.json"), 'w') as f:
                 json.dump(cookies, f)
 
-            # 从页面抓取套餐信息
+            # 从页面抓取套餐信息和 Credits
             plan_name = None
             plan_quota = None
+            official_credits = None
             try:
                 body_text = await page.inner_text('body')
                 plan_match = re.search(r'(Lite|Standard|Pro|Max)\s*(月度|年度)\s*套餐', body_text, re.IGNORECASE)
@@ -272,8 +359,14 @@ async def login():
                     plan_quota = int(quota_match.group(1).replace(',', ''))
                     print(f"  📊 套餐额度: {plan_quota:,} Credits")
 
+                # 尝试抓取已用 Credits
+                used_match = re.search(r'([\d,]+)\s*/\s*[\d,]+', body_text)
+                if used_match:
+                    official_credits = int(used_match.group(1).replace(',', ''))
+                    print(f"  💰 已用 Credits: {official_credits:,}")
+
                 if plan_name:
-                    save_plan_info(plan_name, plan_quota, plan_type)
+                    save_plan_info(plan_name, plan_quota, plan_type, official_credits)
                     print(f"  ✅ 套餐信息已保存到 {PLAN_INFO_FILE}")
                 else:
                     print("  ⚠️  未能从页面识别套餐，将使用用量反推")
@@ -290,9 +383,9 @@ async def login():
             print(f"✅ 已导出: {download.suggested_filename}\n")
 
             if plan_name and plan_quota:
-                analyze_xlsx(xlsx, plan_override=plan_name, quota_override=plan_quota)
+                analyze_xlsx(xlsx, plan_override=plan_name, quota_override=plan_quota, official_credits=official_credits)
             else:
-                analyze_xlsx(xlsx)
+                analyze_xlsx(xlsx, official_credits=official_credits)
 
         except Exception as e:
             print(f"❌ {e}")
@@ -303,17 +396,28 @@ async def login():
 def main():
     args = sys.argv[1:]
 
+    # 解析 --official-credits 参数
+    official_credits = None
+    if "--official-credits" in args:
+        i = args.index("--official-credits")
+        if i + 1 < len(args):
+            try:
+                official_credits = int(args[i + 1].replace(',', ''))
+            except ValueError:
+                print("❌ --official-credits 后需要跟数字")
+                sys.exit(1)
+
     if "--login" in args:
         asyncio.run(login())
     elif "--xlsx" in args:
         i = args.index("--xlsx")
-        analyze_xlsx(args[i + 1]) if i + 1 < len(args) else print("❌ 缺少文件路径")
+        analyze_xlsx(args[i + 1], official_credits=official_credits) if i + 1 < len(args) else print("❌ 缺少文件路径")
     else:
         files = sorted(glob.glob(str(Path.home() / "Downloads" / "token_plan_usage_data_*.xlsx")),
                        key=os.path.getmtime, reverse=True)
         if files:
             print(f"📁 {Path(files[0]).name}")
-            analyze_xlsx(files[0])
+            analyze_xlsx(files[0], official_credits=official_credits)
         else:
             print("❌ 无导出文件，先运行: python mimo-usage-checker.py --login")
 

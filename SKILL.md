@@ -24,7 +24,7 @@ pip install playwright openpyxl && playwright install chromium
 python <skill_dir>/scripts/mimo-usage-checker.py --login
 ```
 
-脚本会弹出浏览器，用户正常登录（支持扫码/短信/密码），登录成功后**自动从页面抓取套餐名称和额度**，保存到 `~/.mimo-usage-checker/plan_info.json`，然后导出 xlsx 并分析。
+脚本会弹出浏览器，用户正常登录（支持扫码/短信/密码），登录成功后**自动从页面抓取套餐名称、额度和已用 Credits**，保存到 `~/.mimo-usage-checker/plan_info.json`，然后导出 xlsx 并分析。
 
 ### 后续使用：分析已有文件
 
@@ -37,6 +37,9 @@ python <skill_dir>/scripts/mimo-usage-checker.py --xlsx <file.xlsx>
 
 # 手动指定套餐（覆盖 plan_info.json）
 python <skill_dir>/scripts/mimo-usage-checker.py --plan standard
+
+# 指定官网显示的 Credits（用于一致性验证）
+python <skill_dir>/scripts/mimo-usage-checker.py --official-credits 3305500000
 ```
 
 ### 套餐识别优先级
@@ -63,13 +66,12 @@ python <skill_dir>/scripts/mimo-usage-checker.py --plan standard
 | Pro | 38B | 456B |
 | Max | 82B | 984B |
 
-## 报告内容
+## 分析报告内容
 
-1. **汇总**：Token 总消耗、Credits 总消耗、套餐使用率
-2. **按模型统计**：每个模型的 Token/Credits/请求占比
-3. **每日明细**：每天的 Token 明细（输入命中/未命中/输出）+ 对应 Credits
-4. **缓存命中率分析**：未命中缓存是 Credits 消耗的主要驱动因素
-5. **非高峰优惠提示**：北京时间 00:00-08:00 享受 0.8x 系数
+1. **① 换算一致性验证**（核心）：对比 xlsx 换算出的 Credits 与官网显示的 Credits，分析差异原因
+2. **② 每日消耗分析**：每天的 Token 明细（输入命中/未命中/输出）+ 对应 Credits + 趋势分析
+3. **③ 按模型汇总**：每个模型的 Token/Credits/请求占比
+4. **④ 套餐用量预估**：按当前速率预估月末用量，判断是否够用
 
 ## 注意事项
 
