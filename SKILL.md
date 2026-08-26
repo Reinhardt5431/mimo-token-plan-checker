@@ -1,13 +1,13 @@
 ---
 name: mimo-token-plan-checker
-description: "MiMo Token Plan 用量分析：导出xlsx并用官方规则换算Token到Credits。"
-version: 1.0.0
+description: "MiMo Token Plan 用量分析：每次自动获取官网最新Credits，与xlsx换算结果交叉验证。"
+version: 2.0.0
 author: hermes-agent
 ---
 
 # MiMo Token Plan 用量分析工具
 
-分析小米 MiMo Token Plan 的消耗情况，用官方换算规则将 Token 折算为 Credits，对比套餐额度。
+分析小米 MiMo Token Plan 的消耗情况。**每次运行自动获取官网最新 Credits**，与 xlsx 导出数据换算结果交叉验证。
 
 ## 触发条件
 
@@ -17,47 +17,49 @@ author: hermes-agent
 
 ## 使用方法
 
-### 首次使用：登录并导出
+### 日常使用（推荐）
 
 ```bash
-pip install playwright openpyxl && playwright install chromium
+python <skill_dir>/scripts/mimo-usage-checker.py
+```
+
+自动执行：
+1. 用已有 Cookie **无头浏览器**获取官网最新 Credits
+2. 找到最近的 xlsx 导出文件
+3. 按官方换算规则计算 Credits
+4. **强制对比**：xlsx 计算值 vs 官网实时值
+5. 输出完整分析报告
+
+### 重新登录（Cookie 过期时）
+
+```bash
 python <skill_dir>/scripts/mimo-usage-checker.py --login
 ```
 
-脚本会弹出浏览器，用户正常登录（支持扫码/短信/密码），登录成功后**自动从页面抓取套餐名称、额度和已用 Credits**，保存到 `~/.mimo-usage-checker/plan_info.json`，然后导出 xlsx 并分析。
+弹出浏览器，自动切换到手机号验证，登录后自动导出并分析。
 
-### 后续使用：分析已有文件
+### 分析指定文件
 
 ```bash
-# 自动查找最近的导出文件（使用已保存的套餐信息）
-python <skill_dir>/scripts/mimo-usage-checker.py
-
-# 指定文件
 python <skill_dir>/scripts/mimo-usage-checker.py --xlsx <file.xlsx>
-
-# 手动指定套餐（覆盖 plan_info.json）
-python <skill_dir>/scripts/mimo-usage-checker.py --plan standard
-
-# 指定官网显示的 Credits（用于一致性验证）
-python <skill_dir>/scripts/mimo-usage-checker.py --official-credits 3305500000
 ```
 
-### 套餐识别优先级
+## 分析报告内容
 
-1. `--plan` 命令行参数（最高优先级）
-2. `~/.mimo-usage-checker/plan_info.json`（login 时自动保存）
-3. 用量反推（兜底，会标注"推测"，不推荐）
+1. **① 换算一致性验证**（核心）：xlsx 计算值 vs 官网实时 Credits，自动按订阅周期过滤历史数据
+2. **② 每日消耗分析**：订阅周期内的每日 Token/Credits 明细 + 趋势分析
+3. **③ 按模型汇总**：各模型的 Token/Credits/请求占比
+4. **④ 套餐用量预估**：基于官网实时数据，按实际订阅周期预估用量
 
-## 官方换算规则（Credits per Token）
+## 官方换算规则
 
 | 模型 | 输入（命中缓存） | 输入（未命中缓存） | 输出 |
 |------|----------------|-------------------|------|
-| mimo-v2.5 | 2 | 100 | 200 |
-| mimo-v2.5-pro | 2.5 | 300 | 600 |
-| mimo-v2.5-asr | 30M Credits/小时音频 | - | - |
-| mimo-v2.5-tts 系列 | 限时免费 | - | - |
+| mimo-v2.5 | 2 Credits | 100 Credits | 200 Credits |
+| mimo-v2.5-pro | 2.5 Credits | 300 Credits | 600 Credits |
+| mimo-v2.5-asr | 30M Credits/小时 | - | - |
 
-## 套餐额度（官方固定）
+## 套餐额度
 
 | 套餐 | 月度 | 年度 |
 |------|------|------|
@@ -66,18 +68,14 @@ python <skill_dir>/scripts/mimo-usage-checker.py --official-credits 3305500000
 | Pro | 38B | 456B |
 | Max | 82B | 984B |
 
-## 分析报告内容
-
-1. **① 换算一致性验证**（核心）：对比 xlsx 换算出的 Credits 与官网显示的 Credits，分析差异原因
-2. **② 每日消耗分析**：每天的 Token 明细（输入命中/未命中/输出）+ 对应 Credits + 趋势分析
-3. **③ 按模型汇总**：每个模型的 Token/Credits/请求占比
-4. **④ 套餐用量预估**：按当前速率预估月末用量，判断是否够用
-
 ## 注意事项
 
-- **xlsx 导出包含全部历史数据，管理台只统计当前订阅周期内的 Credits**。两者 Token 总数一致说明换算公式正确，Credits 差异纯粹是时间范围不同。分析时应以管理台显示的 Credits 为准，xlsx 的 Credits 仅作参考。
-- 非高峰期（北京时间 00:00-08:00）消耗系数为 0.8x
-- TTS 系列模型限时免费，不消耗 Credits
-- 导出的 xlsx 文件在 `~/Downloads/token_plan_usage_data_*.xlsx`
-- Cookie 保存在 `~/.mimo-usage-checker/cookies.json`
-- 套餐信息保存在 `~/.mimo-usage-checker/plan_info.json`（login 时自动抓取）
+- **每次运行都会自动获取最新官网数据**，确保对比有效
+- Cookie 保存在 `~/.mimo-usage-checker/cookies.json`，过期后需 `--login` 重新登录
+- 手机号保存在 `~/.mimo-usage-checker/phone.txt`，首次登录后自动保存
+- 套餐信息保存在 `~/.mimo-usage-checker/plan_info.json`
+- 导出的 xlsx 在 `~/Downloads/token_plan_usage_data_*.xlsx`
+
+## License
+
+MIT

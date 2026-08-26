@@ -2,11 +2,9 @@
 MiMo Token Plan 用量分析工具
 
 用法：
-  python mimo-usage-checker.py --login              # 首次登录（弹出浏览器）
-  python mimo-usage-checker.py                      # 分析最近的导出文件
-  python mimo-usage-checker.py --xlsx <file.xlsx>   # 分析指定文件
-  python mimo-usage-checker.py --plan standard      # 手动指定套餐
-  python mimo-usage-checker.py --official-credits 3305500000  # 指定官网显示的 Credits 数值
+  python mimo-usage-checker.py                        # 自动获取最新官网数据 + 分析
+  python mimo-usage-checker.py --login                # 弹出浏览器重新登录
+  python mimo-usage-checker.py --xlsx <file.xlsx>     # 分析指定文件
 """
 import asyncio
 import json
@@ -21,6 +19,7 @@ from collections import defaultdict
 CONFIG_DIR = os.path.expanduser("~/.mimo-usage-checker")
 PLAN_INFO_FILE = os.path.join(CONFIG_DIR, "plan_info.json")
 PHONE_FILE = os.path.join(CONFIG_DIR, "phone.txt")
+COOKIE_FILE = os.path.join(CONFIG_DIR, "cookies.json")
 
 # ===== 官方换算规则（不可改）=====
 CREDIT_RATES = {
@@ -47,11 +46,14 @@ def load_plan_info():
     return None
 
 
-def save_plan_info(plan_name, quota, plan_type="monthly", official_credits=None):
+def save_plan_info(plan_name, quota, plan_type="monthly",
+                   official_credits=None, valid_until=None):
     os.makedirs(CONFIG_DIR, exist_ok=True)
     info = {"plan_name": plan_name, "quota": quota, "plan_type": plan_type}
     if official_credits is not None:
         info["official_credits"] = official_credits
+    if valid_until is not None:
+        info["valid_until"] = valid_until
     with open(PLAN_INFO_FILE, "w", encoding="utf-8") as f:
         json.dump(info, f, ensure_ascii=False, indent=2)
 
@@ -85,12 +87,94 @@ def fmt(n):
     return f"{n:.0f}"
 
 
-def analyze_xlsx(filepath, plan_override=None, quota_override=None, official_credits=None):
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 核心：从 MiMo 控制台抓取最新官网数据（headless 模式）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+async def fetch_official_data():
+    """用已有 Cookie 在 headless 模式下抓取官网最新 Credits"""
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        print("❌ 需要安装: pip install playwright")
+        return None
+
+    if not os.path.exists(COOKIE_FILE):
+        print("❌ 无已保存的 Cookie，请先运行: python mimo-usage-checker.py --login")
+        return None
+
+    with open(COOKIE_FILE, "r", encoding="utf-8") as f:
+        cookies = json.load(f)
+
+    result = {}
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        ctx = await browser.new_context()
+        await ctx.add_cookies(cookies)
+        page = await ctx.new_page()
+        await page.goto('https://platform.xiaomimimo.com/console/plan-manage')
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=20000)
+            await asyncio.sleep(3)
+
+            current_url = page.url
+            if "/console/" not in current_url:
+                print("⚠️  Cookie 已过期，请重新登录: python mimo-usage-checker.py --login")
+                await browser.close()
+                return None
+
+            body_text = await page.inner_text('body')
+
+            # 提取套餐名称
+            plan_match = re.search(r'(Lite|Standard|Pro|Max)\s*(月度|年度)\s*套餐', body_text, re.IGNORECASE)
+            if plan_match:
+                result["plan_name"] = plan_match.group(1)
+                result["plan_type"] = "monthly" if "月度" in plan_match.group(2) else "yearly"
+
+            # 提取 "已使用 X%" 上方的 "used / total" 格式
+            credits_match = re.search(
+                r'([\d,]+)\s*/\s*([\d,]+)\s*\n\s*已使用\s*([\d.]+)%', body_text)
+            if credits_match:
+                result["official_credits"] = int(credits_match.group(1).replace(',', ''))
+                result["quota"] = int(credits_match.group(2).replace(',', ''))
+                result["used_pct"] = credits_match.group(3)
+
+            # 提取有效期
+            valid_match = re.search(r'有效期至\s*(\d{4}-\d{2}-\d{2})', body_text)
+            if valid_match:
+                result["valid_until"] = valid_match.group(1)
+
+            # 提取 Token 总消耗
+            token_match = re.search(r'Token 总消耗\s*\n\s*([\d,]+)\s*Tokens', body_text)
+            if token_match:
+                result["total_tokens"] = int(token_match.group(1).replace(',', ''))
+
+        except Exception as e:
+            print(f"⚠️  抓取失败: {e}")
+        finally:
+            await browser.close()
+
+    return result if result else None
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 分析 xlsx 并输出报告
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def analyze_xlsx(filepath, plan_override=None, quota_override=None,
+                 official_credits=None, official_data=None):
     try:
         import openpyxl
     except ImportError:
         print("❌ 需要安装: pip install openpyxl")
         return
+
+    # 从 official_data 提取信息
+    if official_data:
+        official_credits = official_data.get("official_credits", official_credits)
+        if not plan_override:
+            plan_override = official_data.get("plan_name")
+        if not quota_override:
+            quota_override = official_data.get("quota")
 
     wb = openpyxl.load_workbook(filepath)
     ws = wb.active
@@ -105,7 +189,9 @@ def analyze_xlsx(filepath, plan_override=None, quota_override=None, official_cre
         "output": 0, "credits": 0, "requests": 0
     })
 
+    all_rows = []
     for row in ws.iter_rows(min_row=2, values_only=True):
+        all_rows.append(row)
         date, model, total_tokens, input_hit, input_miss, output, audio_dur, req_count = row
         if model not in CREDIT_RATES:
             continue
@@ -148,7 +234,7 @@ def analyze_xlsx(filepath, plan_override=None, quota_override=None, official_cre
             plan_name = "max (推测)"
             quota = PLAN_QUOTAS["max"]["monthly"]
 
-    # 全局汇总
+    # xlsx 全量汇总
     total_tk = sum(v["total_tokens"] for v in daily.values())
     total_ih = sum(v["input_hit"] for v in daily.values())
     total_im = sum(v["input_miss"] for v in daily.values())
@@ -157,104 +243,142 @@ def analyze_xlsx(filepath, plan_override=None, quota_override=None, official_cre
     total_rc = sum(v["requests"] for v in daily.values())
     total_input = total_ih + total_im
 
-    # 模型汇总
-    model_agg = defaultdict(lambda: {
-        "tokens": 0, "input_hit": 0, "input_miss": 0,
-        "output": 0, "credits": 0, "requests": 0
-    })
-    for v in daily.values():
-        for model, md in v["models"].items():
-            for k in model_agg[model]:
-                model_agg[model][k] += md[k]
+    # 按订阅周期过滤（如果有有效期信息）
+    valid_until_str = (official_data or {}).get("valid_until")
+    cycle_start = None
+    if valid_until_str:
+        # 套餐有效期通常是 1 个月，倒推起始日
+        valid_until = datetime.datetime.strptime(valid_until_str, "%Y-%m-%d").date()
+        # 从页面提取的套餐名推断是月度还是年度
+        if plan_type_yearly(plan_name, official_data):
+            cycle_start = valid_until - datetime.timedelta(days=365)
+        else:
+            cycle_start = valid_until - datetime.timedelta(days=30)
+
+    # 订阅周期内汇总
+    cycle_tk = 0
+    cycle_ih = 0
+    cycle_im = 0
+    cycle_ot = 0
+    cycle_cr = 0
+    cycle_rc = 0
+    cycle_input = 0
+    cycle_daily = {}
+
+    for d_str, v in daily.items():
+        in_cycle = True
+        if cycle_start:
+            try:
+                d_date = datetime.datetime.strptime(d_str, "%Y-%m-%d").date()
+                in_cycle = d_date >= cycle_start
+            except:
+                pass
+        if in_cycle:
+            cycle_tk += v["total_tokens"]
+            cycle_ih += v["input_hit"]
+            cycle_im += v["input_miss"]
+            cycle_ot += v["output"]
+            cycle_cr += v["credits"]
+            cycle_rc += v["requests"]
+            cycle_input += v["input_hit"] + v["input_miss"]
+            cycle_daily[d_str] = v
 
     # ===== 输出 =====
     print()
     print("=" * 90)
     print("  MiMo Token Plan 用量分析")
     print("=" * 90)
+    if valid_until_str:
+        print(f"  订阅周期: {cycle_start} ~ {valid_until_str}")
     print()
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 核心分析一：换算一致性验证
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     print("━" * 90)
-    print("  ① 换算一致性验证：xlsx 计算值 vs 官网显示值")
+    print("  ① 换算一致性验证：xlsx 计算值 vs 官网实时显示值")
     print("━" * 90)
     print()
 
-    # 从 plan_info 读取官网 Credits
-    if official_credits is None:
-        info = load_plan_info()
-        if info and "official_credits" in info:
-            official_credits = info["official_credits"]
-
-    print(f"  xlsx 换算 Credits（按官方公式计算）:  {total_cr:>15,.0f}")
-    print(f"  Token 总量（xlsx 导出）:              {total_tk:>15,}")
+    print(f"  📊 xlsx 全量换算 Credits:              {total_cr:>15,.0f}")
+    if cycle_start:
+        print(f"  📊 订阅周期内换算 Credits:             {cycle_cr:>15,.0f}")
+        print(f"     （过滤 {cycle_start} 之前的历史数据）")
     print()
 
     if official_credits is not None and official_credits > 0:
-        diff = total_cr - official_credits
+        print(f"  🌐 官网实时显示 Credits:               {official_credits:>15,.0f}")
+
+        # 用订阅周期内的数据对比（更准确）
+        compare_cr = cycle_cr if cycle_start else total_cr
+        diff = compare_cr - official_credits
         diff_pct = abs(diff) / official_credits * 100 if official_credits else 0
-        print(f"  官网显示 Credits:                     {official_credits:>15,.0f}")
-        print(f"  差异（xlsx - 官网）:                  {diff:>+15,.0f}  ({diff_pct:+.2f}%)")
+
+        if cycle_start:
+            print(f"  📐 对比基准（周期内 xlsx）:             {compare_cr:>15,.0f}")
+        print(f"  📏 差异（xlsx - 官网）:                  {diff:>+15,.0f}  ({diff_pct:+.2f}%)")
         print()
 
         if abs(diff) < official_credits * 0.01:
             print("  ✅ 一致：xlsx 换算结果与官网显示基本一致（差异 < 1%）")
-            print("     说明：换算公式正确，数据无异常。")
+            print("     结论：换算公式正确，数据无异常。")
         elif diff > 0:
             print("  ⚠️  xlsx 计算值 > 官网显示值")
             print("     可能原因：")
-            print("     1. xlsx 包含历史数据，官网只统计当前订阅周期")
-            print("     2. 非高峰时段（00:00-08:00）0.8x 系数未在 xlsx 中体现")
-            print("     3. 官网可能排除了某些调试/测试请求")
+            print("     1. 非高峰时段（00:00-08:00）0.8x 系数未在 xlsx 中体现")
+            print("     2. 官网可能排除了某些调试/测试请求")
+            print("     3. xlsx 导出与官网统计存在时间差（~5分钟延迟）")
         else:
             print("  ⚠️  xlsx 计算值 < 官网显示值")
             print("     可能原因：")
-            print("     1. xlsx 未包含最近的消耗数据（导出延迟）")
+            print("     1. xlsx 导出延迟，未包含最近的消耗")
             print("     2. 官网可能包含了 xlsx 未记录的其他消耗来源")
-            print("     3. 换算规则可能有更新，xlsx 数据对应旧规则")
+            print("     3. 换算规则可能有更新")
     else:
-        print("  ⚠️  未提供官网 Credits 数值")
-        print("     对比方式：")
-        print("     1. 登录官网查看当前 Credits，然后重新运行：")
-        print("        python mimo-usage-checker.py --official-credits <数值>")
-        print("     2. 或在 --login 时从页面自动抓取（需更新控制台页面结构）")
+        print("  ❌ 未能获取官网 Credits 数据")
+        print("     请检查 Cookie 是否有效，或重新登录: --login")
     print()
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 核心分析二：每日消耗分析
+    # 核心分析二：每日消耗分析（仅订阅周期内）
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     print("━" * 90)
-    print("  ② 每日消耗分析")
+    print("  ② 每日消耗分析" + ("（订阅周期内）" if cycle_start else ""))
     print("━" * 90)
     print()
 
+    display_daily = cycle_daily if cycle_start else daily
     print(f"  {'日期':<12} {'周':>2} {'Tokens':>12} {'缓存命中':>8} {'未命中':>10} {'输出':>8} {'Credits':>14} {'请求':>6}")
     print(f"  {'─'*12} {'─'*2} {'─'*12} {'─'*8} {'─'*10} {'─'*8} {'─'*14} {'─'*6}")
 
-    # 找出高峰/非高峰日
-    peak_days = []
-    off_peak_days = []
-
-    for d in sorted(daily.keys()):
-        v = daily[d]
+    for d in sorted(display_daily.keys()):
+        v = display_daily[d]
         dt = datetime.datetime.strptime(d, "%Y-%m-%d")
         wd = WEEKDAYS[dt.weekday()]
         ti = v["input_hit"] + v["input_miss"]
         hit_pct = f"{v['input_hit']/ti*100:.0f}%" if ti else "—"
         print(f"  {d:<12} {wd:>2} {v['total_tokens']:>12,} {hit_pct:>8} {v['input_miss']:>10,} {v['output']:>8,} {v['credits']:>14,.0f} {v['requests']:>6}")
 
+    # 汇总行
+    d_tk = sum(v["total_tokens"] for v in display_daily.values())
+    d_ih = sum(v["input_hit"] for v in display_daily.values())
+    d_im = sum(v["input_miss"] for v in display_daily.values())
+    d_ot = sum(v["output"] for v in display_daily.values())
+    d_cr = sum(v["credits"] for v in display_daily.values())
+    d_rc = sum(v["requests"] for v in display_daily.values())
+    d_inp = d_ih + d_im
+    days = len(display_daily)
+
     print(f"  {'─'*12} {'─'*2} {'─'*12} {'─'*8} {'─'*10} {'─'*8} {'─'*14} {'─'*6}")
-    hit_pct_all = f"{total_ih/total_input*100:.0f}%" if total_input else "—"
-    print(f"  {'合计':<12} {'':>2} {total_tk:>12,} {hit_pct_all:>8} {total_im:>10,} {total_ot:>8,} {total_cr:>14,.0f} {total_rc:>6}")
-    days = len(daily)
-    print(f"  {'日均':<12} {'':>2} {total_tk//days:>12,} {'':>8} {'':>10} {'':>8} {total_cr/days:>14,.0f} {total_rc//days:>6}")
+    hit_pct_all = f"{d_ih/d_inp*100:.0f}%" if d_inp else "—"
+    print(f"  {'合计':<12} {'':>2} {d_tk:>12,} {hit_pct_all:>8} {d_im:>10,} {d_ot:>8,} {d_cr:>14,.0f} {d_rc:>6}")
+    if days > 0:
+        print(f"  {'日均':<12} {'':>2} {d_tk//days:>12,} {'':>8} {'':>10} {'':>8} {d_cr/days:>14,.0f} {d_rc//days:>6}")
     print()
 
-    # 每日趋势分析
-    daily_list = sorted(daily.items())
-    if len(daily_list) >= 2:
+    # 趋势
+    if days >= 2:
+        daily_list = sorted(display_daily.items())
         credits_values = [v["credits"] for _, v in daily_list]
         avg_cr = sum(credits_values) / len(credits_values)
         max_day = max(daily_list, key=lambda x: x[1]["credits"])
@@ -264,7 +388,8 @@ def analyze_xlsx(filepath, plan_override=None, quota_override=None, official_cre
         print(f"     日均 Credits: {avg_cr:,.0f}")
         print(f"     最高日: {max_day[0]} ({max_day[1]['credits']:,.0f} Credits, {max_day[1]['requests']:,} 请求)")
         print(f"     最低日: {min_day[0]} ({min_day[1]['credits']:,.0f} Credits, {min_day[1]['requests']:,} 请求)")
-        print(f"     波动范围: {max_day[1]['credits']/min_day[1]['credits']:.1f}x" if min_day[1]["credits"] > 0 else "")
+        if min_day[1]["credits"] > 0:
+            print(f"     波动范围: {max_day[1]['credits']/min_day[1]['credits']:.1f}x")
     print()
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -277,8 +402,17 @@ def analyze_xlsx(filepath, plan_override=None, quota_override=None, official_cre
     print(f"  {'模型':<18} {'Tokens':>14} {'命中':>12} {'未命中':>10} {'输出':>10} {'Credits':>14} {'占比':>6} {'请求':>6}")
     print(f"  {'─'*18} {'─'*14} {'─'*12} {'─'*10} {'─'*10} {'─'*14} {'─'*6} {'─'*6}")
 
+    model_agg = defaultdict(lambda: {
+        "tokens": 0, "input_hit": 0, "input_miss": 0,
+        "output": 0, "credits": 0, "requests": 0
+    })
+    for v in display_daily.values():
+        for model, md in v["models"].items():
+            for k in model_agg[model]:
+                model_agg[model][k] += md[k]
+
     for model, s in sorted(model_agg.items(), key=lambda x: -x[1]["credits"]):
-        p = s["credits"] / total_cr * 100 if total_cr else 0
+        p = s["credits"] / d_cr * 100 if d_cr else 0
         print(f"  {model:<18} {s['tokens']:>14,} {s['input_hit']:>12,} {s['input_miss']:>10,} {s['output']:>10,} {s['credits']:>14,.0f} {p:>5.1f}% {s['requests']:>6}")
 
     print()
@@ -289,34 +423,73 @@ def analyze_xlsx(filepath, plan_override=None, quota_override=None, official_cre
     print("=" * 90)
     print()
 
-    # 套餐用量预估
-    if days > 0:
-        print("━" * 90)
-        print("  ④ 套餐用量预估")
-        print("━" * 90)
-        print()
-        today = datetime.date.today()
-        days_in_month = (today.replace(month=today.month % 12 + 1, day=1) - datetime.timedelta(days=1)).day if today.month < 12 else 31
-        days_passed = today.day
-        days_remaining = days_in_month - days_passed
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ④ 套餐用量预估（基于官网实时数据 + 订阅周期）
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    print("━" * 90)
+    print("  ④ 套餐用量预估" + ("（基于官网实时数据）" if official_credits else ""))
+    print("━" * 90)
+    print()
 
-        projected = total_cr / days_passed * days_in_month if days_passed > 0 else 0
-        remaining = quota - total_cr
-        daily_burn = total_cr / days_passed if days_passed > 0 else 0
-        days_left = remaining / daily_burn if daily_burn > 0 else float('inf')
+    today = datetime.date.today()
+
+    if valid_until_str and official_credits is not None:
+        # 基于官网实时数据计算
+        valid_until = datetime.datetime.strptime(valid_until_str, "%Y-%m-%d").date()
+        days_total = (valid_until - cycle_start).days if cycle_start else 30
+        days_used = (today - cycle_start).days if cycle_start else today.day
+        days_remaining = (valid_until - today).days
+
+        daily_burn = official_credits / days_used if days_used > 0 else 0
+        projected = official_credits / days_used * days_total if days_used > 0 else 0
+        remaining = quota - official_credits
+
+        print(f"  订阅周期:   {cycle_start} ~ {valid_until_str}（共 {days_total} 天）")
+        print(f"  已过天数:   第 {days_used}/{days_total} 天（剩余 {days_remaining} 天）")
+        print(f"  官网已用:   {fmt(official_credits)} Credits ({official_credits/quota*100:.1f}%)")
+        print(f"  剩余额度:   {fmt(remaining)} Credits")
+        print(f"  日均消耗:   {fmt(daily_burn)} Credits/天")
+        print(f"  预估周期末: {fmt(projected)} Credits ({projected/quota*100:.1f}%)")
+
+        if days_remaining > 0:
+            days_left = remaining / daily_burn if daily_burn > 0 else float('inf')
+            if days_left < days_remaining:
+                print(f"  ⚠️  按当前速率，约 {days_left:.0f} 天后用完（还剩 {days_remaining} 天）")
+            else:
+                print(f"  ✅ 按当前速率，周期内够用（预计剩余 {days_left - days_remaining:.0f} 天余量）")
+    elif days > 0:
+        # 降级：用 xlsx 数据估算
+        days_passed = today.day
+        daily_burn = d_cr / days_passed if days_passed > 0 else 0
+        remaining = quota - d_cr
+        days_in_month = (today.replace(month=today.month % 12 + 1, day=1) - datetime.timedelta(days=1)).day if today.month < 12 else 31
+        days_rem = days_in_month - today.day
+        projected = d_cr / days_passed * days_in_month if days_passed > 0 else 0
 
         print(f"  当前天数:  月度第 {days_passed}/{days_in_month} 天")
-        print(f"  已用:      {fmt(total_cr)} Credits ({total_cr/quota*100:.1f}%)")
+        print(f"  已用:      {fmt(d_cr)} Credits ({d_cr/quota*100:.1f}%)")
         print(f"  剩余:      {fmt(remaining)} Credits")
         print(f"  日均消耗:  {fmt(daily_burn)} Credits/天")
         print(f"  预估月末:  {fmt(projected)} Credits ({projected/quota*100:.1f}%)")
-        if days_left < days_remaining:
-            print(f"  ⚠️  按当前速率，约 {days_left:.0f} 天后用完（本月还剩 {days_remaining} 天）")
-        else:
-            print(f"  ✅ 按当前速率，月底前够用（预计剩余 {days_left - days_remaining:.0f} 天的余量）")
-        print()
+        if daily_burn > 0:
+            days_left = remaining / daily_burn
+            if days_left < days_rem:
+                print(f"  ⚠️  按当前速率，约 {days_left:.0f} 天后用完")
+            else:
+                print(f"  ✅ 按当前速率，月底前够用")
+    print()
 
 
+def plan_type_yearly(plan_name, official_data):
+    """从 official_data 判断是否年度套餐"""
+    if official_data and official_data.get("plan_type") == "yearly":
+        return True
+    return False
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 登录流程
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 async def login():
     try:
         from playwright.async_api import async_playwright
@@ -334,9 +507,8 @@ async def login():
         ctx = await browser.new_context(accept_downloads=True)
 
         # 加载已保存的 Cookie
-        cookie_file = os.path.join(CONFIG_DIR, "cookies.json")
-        if os.path.exists(cookie_file):
-            with open(cookie_file, "r", encoding="utf-8") as f:
+        if os.path.exists(COOKIE_FILE):
+            with open(COOKIE_FILE, "r", encoding="utf-8") as f:
                 cookies = json.load(f)
             await ctx.add_cookies(cookies)
             print("  🍪 已加载保存的 Cookie\n")
@@ -350,10 +522,8 @@ async def login():
             await asyncio.sleep(2)
 
             current_url = page.url
-            # 如果不在 console 页面，说明需要登录
             if "/console/" not in current_url:
                 print("🔐 需要登录，正在切换到手机号验证...\n")
-                # 尝试点击"手机号登录"或"短信验证"标签
                 sms_selectors = [
                     'text=手机号登录',
                     'text=短信登录',
@@ -388,17 +558,13 @@ async def login():
                             await phone_inputs.first.fill(saved_phone)
                             print(f"  📱 已自动填入手机号: {saved_phone[:3]}****{saved_phone[-4:]}\n")
                 else:
-                    # 首次运行，提示输入手机号并保存
                     phone_inputs = page.locator('input[placeholder*="手机"], input[placeholder*="电话"], input[type="tel"], input[name*="phone"], input[name*="mobile"]')
                     if await phone_inputs.count() > 0:
                         print("  📱 检测到手机号输入框，请输入手机号（将自动保存供下次使用）")
-                        # 等待用户手动输入，然后保存
                         await phone_inputs.first.wait_for(state="visible", timeout=60000)
-                        # 等用户填完手机号并点获取验证码
                         await asyncio.sleep(3)
                         phone_val = await phone_inputs.first.input_value()
                         if phone_val and len(phone_val) >= 11:
-                            os.makedirs(CONFIG_DIR, exist_ok=True)
                             with open(PHONE_FILE, "w", encoding="utf-8") as f:
                                 f.write(phone_val)
                             print(f"  ✅ 手机号已保存: {phone_val[:3]}****{phone_val[-4:]}\n")
@@ -406,16 +572,17 @@ async def login():
             await page.wait_for_url('**/console/**', timeout=300000)
             print("✅ 登录成功，正在抓取套餐信息...")
 
+            # 保存 Cookie
             cookies = await ctx.cookies()
-            with open(os.path.join(CONFIG_DIR, "cookies.json"), 'w') as f:
+            with open(COOKIE_FILE, 'w') as f:
                 json.dump(cookies, f)
 
-            # 从页面抓取套餐信息和 Credits
+            # 抓取套餐信息
             plan_name = None
             plan_quota = None
             official_credits = None
+            valid_until = None
             try:
-                # 等待页面数据加载完成
                 await asyncio.sleep(3)
                 body_text = await page.inner_text('body')
                 plan_match = re.search(r'(Lite|Standard|Pro|Max)\s*(月度|年度)\s*套餐', body_text, re.IGNORECASE)
@@ -424,25 +591,22 @@ async def login():
                     plan_type = "monthly" if "月度" in plan_match.group(2) else "yearly"
                     print(f"  📋 检测到套餐: {plan_name} {plan_match.group(2)}套餐")
 
-                # 精确匹配 "已使用 X%" 上方的 "used / total" 格式
-                # 页面格式: "1,137,546,185 / 11,000,000,000\n已使用 10.0%"
-                credits_match = re.search(r'([\d,]+)\s*/\s*([\d,]+)\s*\n\s*已使用\s*([\d.]+)%', body_text)
+                credits_match = re.search(
+                    r'([\d,]+)\s*/\s*([\d,]+)\s*\n\s*已使用\s*([\d.]+)%', body_text)
                 if credits_match:
                     official_credits = int(credits_match.group(1).replace(',', ''))
                     plan_quota = int(credits_match.group(2).replace(',', ''))
                     used_pct = credits_match.group(3)
                     print(f"  💰 当前套餐用量: {official_credits:,} / {plan_quota:,} Credits (已使用 {used_pct}%)")
-                else:
-                    # 备用：尝试匹配简单的 "used / total" 格式
-                    credits_match2 = re.search(r'([\d,]+)\s*/\s*([\d,]+)', body_text)
-                    if credits_match2:
-                        official_credits = int(credits_match2.group(1).replace(',', ''))
-                        plan_quota = int(credits_match2.group(2).replace(',', ''))
-                        print(f"  💰 当前套餐用量: {official_credits:,} / {plan_quota:,} Credits")
+
+                valid_match = re.search(r'有效期至\s*(\d{4}-\d{2}-\d{2})', body_text)
+                if valid_match:
+                    valid_until = valid_match.group(1)
+                    print(f"  📅 有效期至: {valid_until}")
 
                 if plan_name:
-                    save_plan_info(plan_name, plan_quota, plan_type, official_credits)
-                    print(f"  ✅ 套餐信息已保存到 {PLAN_INFO_FILE}")
+                    save_plan_info(plan_name, plan_quota, plan_type, official_credits, valid_until)
+                    print(f"  ✅ 信息已保存")
                 else:
                     print("  ⚠️  未能从页面识别套餐，将使用用量反推")
             except Exception as e:
@@ -450,7 +614,6 @@ async def login():
 
             # 导出 xlsx
             print("\n📥 正在导出数据...")
-            # 等待页面加载完成，找到所有导出按钮，取最后一个（通常是数据表格区域的导出）
             export_btns = page.locator('button:has-text("导出")')
             await export_btns.last.wait_for(state="visible", timeout=10000)
             async with page.expect_download(timeout=30000) as dl_info:
@@ -460,10 +623,13 @@ async def login():
             await download.save_as(xlsx)
             print(f"✅ 已导出: {download.suggested_filename}\n")
 
-            if plan_name and plan_quota:
-                analyze_xlsx(xlsx, plan_override=plan_name, quota_override=plan_quota, official_credits=official_credits)
-            else:
-                analyze_xlsx(xlsx, official_credits=official_credits)
+            official_data = {
+                "official_credits": official_credits,
+                "plan_name": plan_name,
+                "quota": plan_quota,
+                "valid_until": valid_until,
+            }
+            analyze_xlsx(xlsx, official_data=official_data)
 
         except Exception as e:
             print(f"❌ {e}")
@@ -471,33 +637,46 @@ async def login():
             await browser.close()
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 主入口
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+async def default_run():
+    """默认模式：自动获取最新官网数据 + 分析"""
+    print("🔍 正在获取官网最新数据...\n")
+
+    # 1. 抓取官网最新数据
+    official_data = await fetch_official_data()
+    if official_data:
+        pc = official_data.get('official_credits', 0)
+        print(f"  ✅ 官网数据: {pc:,} Credits" if pc else "  ⚠️  未获取到 Credits")
+    else:
+        print("  ⚠️  无法获取官网数据，将使用本地缓存")
+        official_data = {}
+
+    # 2. 找最新的 xlsx
+    files = sorted(glob.glob(str(Path.home() / "Downloads" / "token_plan_usage_data_*.xlsx")),
+                   key=os.path.getmtime, reverse=True)
+    if not files:
+        print("❌ 无导出文件，先运行: python mimo-usage-checker.py --login")
+        return
+
+    print(f"\n📁 分析: {Path(files[0]).name}\n")
+    analyze_xlsx(files[0], official_data=official_data)
+
+
 def main():
     args = sys.argv[1:]
-
-    # 解析 --official-credits 参数
-    official_credits = None
-    if "--official-credits" in args:
-        i = args.index("--official-credits")
-        if i + 1 < len(args):
-            try:
-                official_credits = int(args[i + 1].replace(',', ''))
-            except ValueError:
-                print("❌ --official-credits 后需要跟数字")
-                sys.exit(1)
 
     if "--login" in args:
         asyncio.run(login())
     elif "--xlsx" in args:
         i = args.index("--xlsx")
-        analyze_xlsx(args[i + 1], official_credits=official_credits) if i + 1 < len(args) else print("❌ 缺少文件路径")
-    else:
-        files = sorted(glob.glob(str(Path.home() / "Downloads" / "token_plan_usage_data_*.xlsx")),
-                       key=os.path.getmtime, reverse=True)
-        if files:
-            print(f"📁 {Path(files[0]).name}")
-            analyze_xlsx(files[0], official_credits=official_credits)
+        if i + 1 < len(args):
+            analyze_xlsx(args[i + 1])
         else:
-            print("❌ 无导出文件，先运行: python mimo-usage-checker.py --login")
+            print("❌ 缺少文件路径")
+    else:
+        asyncio.run(default_run())
 
 
 if __name__ == "__main__":
