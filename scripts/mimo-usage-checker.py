@@ -20,6 +20,7 @@ from collections import defaultdict
 
 CONFIG_DIR = os.path.expanduser("~/.mimo-usage-checker")
 PLAN_INFO_FILE = os.path.join(CONFIG_DIR, "plan_info.json")
+PHONE_FILE = os.path.join(CONFIG_DIR, "phone.txt")
 
 # ===== 官方换算规则（不可改）=====
 CREDIT_RATES = {
@@ -326,7 +327,7 @@ async def login():
     os.makedirs(CONFIG_DIR, exist_ok=True)
     dl = str(Path.home() / "Downloads")
 
-    print("🚀 浏览器即将弹出，请登录（支持扫码/短信/密码）...\n")
+    print("🚀 浏览器即将弹出，请用手机号验证登录...\n")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
@@ -344,6 +345,64 @@ async def login():
         await page.goto('https://platform.xiaomimimo.com/console/plan-manage')
 
         try:
+            # 等待页面加载，判断是否需要登录
+            await page.wait_for_load_state("networkidle", timeout=15000)
+            await asyncio.sleep(2)
+
+            current_url = page.url
+            # 如果不在 console 页面，说明需要登录
+            if "/console/" not in current_url:
+                print("🔐 需要登录，正在切换到手机号验证...\n")
+                # 尝试点击"手机号登录"或"短信验证"标签
+                sms_selectors = [
+                    'text=手机号登录',
+                    'text=短信登录',
+                    'text=短信验证登录',
+                    'text=短信验证码登录',
+                    '[class*="tab"]:has-text("手机")',
+                    '[class*="tab"]:has-text("短信")',
+                    'div[role="tab"]:has-text("手机")',
+                    'span:has-text("手机号")',
+                ]
+                clicked = False
+                for sel in sms_selectors:
+                    try:
+                        loc = page.locator(sel).first
+                        if await loc.is_visible(timeout=2000):
+                            await loc.click()
+                            print(f"  ✅ 已切换到手机号验证\n")
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+                if not clicked:
+                    print("  ⚠️  未找到手机号登录选项，请手动选择手机号验证方式\n")
+
+                # 自动填入已保存的手机号
+                if os.path.exists(PHONE_FILE):
+                    with open(PHONE_FILE, "r", encoding="utf-8") as f:
+                        saved_phone = f.read().strip()
+                    if saved_phone:
+                        phone_inputs = page.locator('input[placeholder*="手机"], input[placeholder*="电话"], input[type="tel"], input[name*="phone"], input[name*="mobile"]')
+                        if await phone_inputs.count() > 0:
+                            await phone_inputs.first.fill(saved_phone)
+                            print(f"  📱 已自动填入手机号: {saved_phone[:3]}****{saved_phone[-4:]}\n")
+                else:
+                    # 首次运行，提示输入手机号并保存
+                    phone_inputs = page.locator('input[placeholder*="手机"], input[placeholder*="电话"], input[type="tel"], input[name*="phone"], input[name*="mobile"]')
+                    if await phone_inputs.count() > 0:
+                        print("  📱 检测到手机号输入框，请输入手机号（将自动保存供下次使用）")
+                        # 等待用户手动输入，然后保存
+                        await phone_inputs.first.wait_for(state="visible", timeout=60000)
+                        # 等用户填完手机号并点获取验证码
+                        await asyncio.sleep(3)
+                        phone_val = await phone_inputs.first.input_value()
+                        if phone_val and len(phone_val) >= 11:
+                            os.makedirs(CONFIG_DIR, exist_ok=True)
+                            with open(PHONE_FILE, "w", encoding="utf-8") as f:
+                                f.write(phone_val)
+                            print(f"  ✅ 手机号已保存: {phone_val[:3]}****{phone_val[-4:]}\n")
+
             await page.wait_for_url('**/console/**', timeout=300000)
             print("✅ 登录成功，正在抓取套餐信息...")
 
@@ -356,6 +415,8 @@ async def login():
             plan_quota = None
             official_credits = None
             try:
+                # 等待页面数据加载完成
+                await asyncio.sleep(3)
                 body_text = await page.inner_text('body')
                 plan_match = re.search(r'(Lite|Standard|Pro|Max)\s*(月度|年度)\s*套餐', body_text, re.IGNORECASE)
                 if plan_match:
@@ -363,16 +424,21 @@ async def login():
                     plan_type = "monthly" if "月度" in plan_match.group(2) else "yearly"
                     print(f"  📋 检测到套餐: {plan_name} {plan_match.group(2)}套餐")
 
-                quota_match = re.search(r'[\d,]+\s*/\s*([\d,]+)', body_text)
-                if quota_match:
-                    plan_quota = int(quota_match.group(1).replace(',', ''))
-                    print(f"  📊 套餐额度: {plan_quota:,} Credits")
-
-                # 尝试抓取已用 Credits
-                used_match = re.search(r'([\d,]+)\s*/\s*[\d,]+', body_text)
-                if used_match:
-                    official_credits = int(used_match.group(1).replace(',', ''))
-                    print(f"  💰 已用 Credits: {official_credits:,}")
+                # 精确匹配 "已使用 X%" 上方的 "used / total" 格式
+                # 页面格式: "1,137,546,185 / 11,000,000,000\n已使用 10.0%"
+                credits_match = re.search(r'([\d,]+)\s*/\s*([\d,]+)\s*\n\s*已使用\s*([\d.]+)%', body_text)
+                if credits_match:
+                    official_credits = int(credits_match.group(1).replace(',', ''))
+                    plan_quota = int(credits_match.group(2).replace(',', ''))
+                    used_pct = credits_match.group(3)
+                    print(f"  💰 当前套餐用量: {official_credits:,} / {plan_quota:,} Credits (已使用 {used_pct}%)")
+                else:
+                    # 备用：尝试匹配简单的 "used / total" 格式
+                    credits_match2 = re.search(r'([\d,]+)\s*/\s*([\d,]+)', body_text)
+                    if credits_match2:
+                        official_credits = int(credits_match2.group(1).replace(',', ''))
+                        plan_quota = int(credits_match2.group(2).replace(',', ''))
+                        print(f"  💰 当前套餐用量: {official_credits:,} / {plan_quota:,} Credits")
 
                 if plan_name:
                     save_plan_info(plan_name, plan_quota, plan_type, official_credits)
