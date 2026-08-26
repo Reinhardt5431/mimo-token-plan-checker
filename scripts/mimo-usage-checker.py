@@ -384,8 +384,11 @@ async def login():
 
             # 导出 xlsx
             print("\n📥 正在导出数据...")
+            # 等待页面加载完成，找到所有导出按钮，取最后一个（通常是数据表格区域的导出）
+            export_btns = page.locator('button:has-text("导出")')
+            await export_btns.last.wait_for(state="visible", timeout=10000)
             async with page.expect_download(timeout=30000) as dl_info:
-                await page.click('button:has-text("导出")')
+                await export_btns.last.click()
             download = await dl_info.value
             xlsx = os.path.join(dl, download.suggested_filename)
             await download.save_as(xlsx)
